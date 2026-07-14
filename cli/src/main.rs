@@ -5,6 +5,8 @@
 //! keypair, and either simulates or submits the transaction to the chosen
 //! cluster.
 
+use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,9 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use jitosol_pamm_sdk as sdk;
+use solana_client::connection_cache::ConnectionCache;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_commitment_config::CommitmentConfig;
+use solana_connection_cache::client_connection::ClientConnection;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::{read_keypair_file, Keypair},
@@ -250,6 +254,14 @@ struct SwapArgs {
     /// Batch clock account. Defaults to the SDK's SLOT_SOURCE.
     #[arg(long)]
     batch_clock: Option<String>,
+    /// Submit without the interactive confirmation prompt.
+    #[arg(long)]
+    no_confirm: bool,
+    /// Leader TPU address (host:port) to fan the signed transaction to over
+    /// QUIC, bypassing the RPC node. The transaction is sent in the TPU QUIC
+    /// wire format straight to this socket.
+    #[arg(long, default_value = "198.13.140.231:5010")]
+    tpu_address: String,
 }
 
 #[derive(Args)]
@@ -301,7 +313,10 @@ fn cmd_show_pool(g: &GlobalOpts, program_id: &Pubkey, args: &ShowPoolArgs) -> Re
         .with_context(|| format!("fetching pool account {pool}"))?;
     let p = decode_pool(&data)?;
     println!("pool                    {pool}");
-    println!("discriminator           {}", String::from_utf8_lossy(&p.discriminator));
+    println!(
+        "discriminator           {}",
+        String::from_utf8_lossy(&p.discriminator)
+    );
     println!("mid (Q64.64 raw)        {}", p.mid);
     println!("mid (price)             {}", q64_to_f64(p.mid));
     println!("last_updated_slot       {}", p.last_updated_slot);
@@ -434,8 +449,16 @@ fn cmd_update_oracle(g: &GlobalOpts, program_id: &Pubkey, args: &UpdateOracleArg
         None => now_unix_nanos()?,
     };
 
-    let ix = sdk::update_oracle(program_id, &authority.pubkey(), &pool, &slot_source, mid, slot, timestamp);
-    submit_with_client(g, &client, ix, &authority, false)
+    let ix = sdk::update_oracle(
+        program_id,
+        &authority.pubkey(),
+        &pool,
+        &slot_source,
+        mid,
+        slot,
+        timestamp,
+    );
+    submit_with_client(g, &client, ix, &authority, false, false, None)
 }
 
 fn cmd_swap(g: &GlobalOpts, program_id: &Pubkey, args: &SwapArgs) -> Result<()> {
@@ -465,6 +488,24 @@ fn cmd_swap(g: &GlobalOpts, program_id: &Pubkey, args: &SwapArgs) -> Result<()> 
         TokenIn::Right => sdk::SWAP_SIDE_RIGHT_TO_LEFT,
     };
 
+    // Swaps move funds, so confirm interactively unless the user opts out or is
+    // only simulating.
+    if !args.no_confirm && !g.simulate {
+        let (pay, recv) = match args.token_in {
+            TokenIn::Left => ("left", "right"),
+            TokenIn::Right => ("right", "left"),
+        };
+        println!("about to swap on {}", resolve_cluster(&g.rpc_url));
+        println!("  pool           {pool}");
+        println!("  pay in         {} {pay}", args.amount_in);
+        println!("  receive        {recv} (min {})", args.min_tokens_out);
+        println!("  signer         {}", signer.pubkey());
+        if !confirm("proceed with swap?")? {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
     let ix = sdk::swap(
         program_id,
         &signer.pubkey(),
@@ -479,16 +520,27 @@ fn cmd_swap(g: &GlobalOpts, program_id: &Pubkey, args: &SwapArgs) -> Result<()> 
         side,
         args.min_tokens_out,
     );
+    let tpu_address: SocketAddr = args
+        .tpu_address
+        .parse()
+        .with_context(|| format!("parsing --tpu-address '{}'", args.tpu_address))?;
+
     // Swap runs without RPC preflight simulation: the batch-clock / oracle
     // state can shift between preflight and landing, so preflight rejections
-    // are noise rather than signal here.
-    submit_with_opts(g, ix, &signer, true)
+    // are noise rather than signal here. It also sends the signed transaction
+    // straight to the leader's TPU port over QUIC rather than relaying through
+    // the RPC node, to shave latency off landing.
+    submit_with_opts(g, ix, &signer, true, args.no_confirm, Some(tpu_address))
 }
 
 // --- Transaction plumbing ---------------------------------------------------
 
-fn submit(g: &GlobalOpts, ix: solana_sdk::instruction::Instruction, signer: &Keypair) -> Result<()> {
-    submit_with_opts(g, ix, signer, false)
+fn submit(
+    g: &GlobalOpts,
+    ix: solana_sdk::instruction::Instruction,
+    signer: &Keypair,
+) -> Result<()> {
+    submit_with_opts(g, ix, signer, false, false, None)
 }
 
 fn submit_with_opts(
@@ -496,9 +548,19 @@ fn submit_with_opts(
     ix: solana_sdk::instruction::Instruction,
     signer: &Keypair,
     skip_preflight: bool,
+    no_confirm: bool,
+    tpu_address: Option<SocketAddr>,
 ) -> Result<()> {
     let client = rpc_client(g)?;
-    submit_with_client(g, &client, ix, signer, skip_preflight)
+    submit_with_client(
+        g,
+        &client,
+        ix,
+        signer,
+        skip_preflight,
+        no_confirm,
+        tpu_address,
+    )
 }
 
 fn submit_with_client(
@@ -507,17 +569,15 @@ fn submit_with_client(
     ix: solana_sdk::instruction::Instruction,
     signer: &Keypair,
     skip_preflight: bool,
+    no_confirm: bool,
+    tpu_address: Option<SocketAddr>,
 ) -> Result<()> {
     if g.simulate {
         let blockhash = client
             .get_latest_blockhash()
             .context("fetching latest blockhash")?;
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&signer.pubkey()),
-            &[signer],
-            blockhash,
-        );
+        let tx =
+            Transaction::new_signed_with_payer(&[ix], Some(&signer.pubkey()), &[signer], blockhash);
         let sim = client
             .simulate_transaction(&tx)
             .context("simulating transaction")?;
@@ -542,6 +602,15 @@ fn submit_with_client(
         return Ok(());
     }
 
+    // When a TPU address is set, open a QUIC connection cache once and reuse it
+    // across retries. It manages the TPU QUIC handshake (ALPN, client
+    // certificate) so we can push the raw wire transaction straight at the
+    // leader's TPU port instead of relaying through the RPC node.
+    let tpu = tpu_address.map(|addr| {
+        let cache = ConnectionCache::new("bamm-cli-tpu");
+        (cache, addr)
+    });
+
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -557,16 +626,47 @@ fn submit_with_client(
             blockhash,
         );
 
-        let result = client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &tx,
-                client.commitment(),
-                RpcSendTransactionConfig {
-                    skip_preflight,
-                    ..Default::default()
-                },
-            )
-            .context("submitting transaction");
+        let result = if let Some((cache, addr)) = &tpu {
+            // Push the serialized transaction straight at the leader's TPU port
+            // over QUIC. This send is fire-and-forget at the network layer, so
+            // confirmation (unless --no-confirm) is polled separately via RPC.
+            let wire = bincode::serialize(&tx).context("serializing transaction")?;
+            match cache.get_connection(addr).send_data(&wire) {
+                Ok(()) => {
+                    let sig = tx.signatures[0];
+                    if no_confirm {
+                        Ok(sig)
+                    } else {
+                        client
+                            .confirm_transaction_with_spinner(&sig, &blockhash, client.commitment())
+                            .map(|_| sig)
+                            .context("confirming transaction")
+                    }
+                }
+                Err(e) => Err(anyhow!(e)).context("sending transaction to TPU over QUIC"),
+            }
+        } else {
+            let config = RpcSendTransactionConfig {
+                skip_preflight,
+                ..Default::default()
+            };
+            // --no-confirm targets throughput (batch/automated swaps): fire the
+            // transaction and move on rather than blocking on a confirmation
+            // spinner. Retries below still apply to submission failures.
+            if no_confirm {
+                client
+                    .send_transaction_with_config(&tx, config)
+                    .context("submitting transaction")
+            } else {
+                client
+                    .send_and_confirm_transaction_with_spinner_and_config(
+                        &tx,
+                        client.commitment(),
+                        config,
+                    )
+                    .context("submitting transaction")
+            }
+        };
 
         match result {
             Ok(sig) => {
@@ -614,6 +714,22 @@ fn resolve_cluster(url: &str) -> String {
         "localhost" | "localnet" => "http://127.0.0.1:8899".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Prompt on stdin for a yes/no answer, defaulting to no. Treats a closed
+/// stdin (e.g. a non-interactive pipe) as a decline rather than proceeding.
+fn confirm(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N] ");
+    io::stdout().flush().context("flushing prompt")?;
+    let mut input = String::new();
+    let n = io::stdin().read_line(&mut input).context("reading stdin")?;
+    if n == 0 {
+        return Ok(false);
+    }
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn parse_pubkey(s: &str, what: &str) -> Result<Pubkey> {
@@ -674,7 +790,10 @@ struct DecodedPool {
 /// last_updated_slot u64 LE(8) + last_updated_timestamp i64 LE(8).
 fn decode_pool(data: &[u8]) -> Result<DecodedPool> {
     if data.len() < 40 {
-        bail!("pool account too small: {} bytes (expected >= 40)", data.len());
+        bail!(
+            "pool account too small: {} bytes (expected >= 40)",
+            data.len()
+        );
     }
     Ok(DecodedPool {
         discriminator: data[0..8].try_into().unwrap(),

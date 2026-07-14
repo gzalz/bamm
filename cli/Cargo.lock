@@ -321,10 +321,12 @@ name = "bamm-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "jitosol-pamm-sdk",
  "solana-client",
  "solana-commitment-config",
+ "solana-connection-cache",
  "solana-sdk",
 ]
 

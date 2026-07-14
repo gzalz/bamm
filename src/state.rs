@@ -93,3 +93,69 @@ impl Pool {
 impl OnchainAccount for Pool {
     const DISCRIMINATOR: [u8; 8] = *b"pool0000";
 }
+
+/// The batch clock account published by a block builder.
+///
+/// This is an open standard: any trusted block builder can maintain an account
+/// in this layout and have this program honour its slot/timestamp readings (see
+/// `trusted_signers` in [`super::instructions`]). The layout is a fixed header
+/// followed by a per-tick body, (de)serialized with `wincode` in field order —
+/// nothing here is addressed by byte offset.
+///
+/// Header (offset 0, stable across ABI versions):
+///
+///     off  size  field          type      notes
+///     0    8     discriminator  u64       "BATCHCLK" little-endian
+///     8    2     version        u16       ABI version (1)
+///     10   6     _pad           [u8;6]    aligns slot_owner to 16
+///     16   32    slot_owner     Pubkey    writer that opened the current slot
+///
+/// Tick (offset 48):
+///
+///     off  size  field                 type   notes
+///     48   8     slot                  u64    validated == Clock::slot
+///     56   8     slot_start_timestamp  i64    ns UNIX, slot-constant
+///     64   8     timestamp_ns          i64    ns UNIX at this tick
+///     72   8     sequence              u64    monotonic within the slot
+///     80   8     compute_units_used    u64    cumulative CU at tick time
+///     88   8     compute_unit_limit    u64    block CU cap, slot-constant
+#[derive(SchemaRead)]
+pub struct BatchClock {
+    /// Account discriminator; must equal [`BatchClock::DISCRIMINATOR`].
+    pub discriminator: [u8; 8],
+    /// ABI version.
+    pub version: u16,
+    /// Padding aligning `slot_owner` to offset 16.
+    pub _pad: [u8; 6],
+    /// Writer that opened the current slot; checked against `trusted_signers`.
+    pub slot_owner: [u8; 32],
+    /// Current slot; validated to equal the syscall `Clock::slot`.
+    pub slot: u64,
+    /// Slot-constant start timestamp (ns UNIX), set when the slot was opened.
+    pub slot_start_timestamp: i64,
+    /// Timestamp of this tick (ns UNIX).
+    pub timestamp_ns: i64,
+    /// Monotonic sequence number within the slot.
+    pub sequence: u64,
+    /// Cumulative compute units consumed at tick time.
+    pub compute_units_used: u64,
+    /// Block compute-unit cap (slot-constant).
+    pub compute_unit_limit: u64,
+}
+
+impl BatchClock {
+    /// Deserialize a batch clock from raw account data with `wincode`, verifying
+    /// the discriminator.
+    pub fn load(data: &[u8]) -> Result<Self, ProgramError> {
+        let clock = wincode::deserialize::<BatchClock>(data)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if clock.discriminator != Self::DISCRIMINATOR {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(clock)
+    }
+}
+
+impl OnchainAccount for BatchClock {
+    const DISCRIMINATOR: [u8; 8] = *b"BATCHCLK";
+}

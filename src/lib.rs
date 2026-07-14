@@ -97,11 +97,15 @@ mod test {
         }
     }
 
-    // The batch clock account: slot (u64 LE) at offset 48, timestamp in Unix
-    // nanoseconds (i64 LE) at offset 64.
+    // The batch clock account, in the open batch-clock layout: "BATCHCLK"
+    // discriminator at offset 0, the trusted `slot_owner` at offset 16, slot
+    // (u64 LE) at offset 48, and timestamp_ns (i64 LE) at offset 64.
     fn batch_clock_account(slot: u64, timestamp_nanos: i64) -> (Pubkey, Account) {
-        use crate::instructions::SLOT_SOURCE;
-        let mut data = vec![0u8; 72];
+        use crate::instructions::{trusted_signers, SLOT_SOURCE};
+        let mut data = vec![0u8; 96];
+        data[0..8].copy_from_slice(b"BATCHCLK");
+        data[8..10].copy_from_slice(&1u16.to_le_bytes());
+        data[16..48].copy_from_slice(trusted_signers[0].as_ref());
         data[48..56].copy_from_slice(&slot.to_le_bytes());
         data[64..72].copy_from_slice(&timestamp_nanos.to_le_bytes());
         (
@@ -978,8 +982,8 @@ mod test {
     fn swap_fails_on_stale_millis() {
         use crate::error::PammError;
         // Batch clock and syscall clock agree on slot 0, so age is judged in ms.
-        // 200 ms elapsed since the last update (ts in nanoseconds) > 100 ms.
-        let (program_id, ix, accounts) = stale_swap_fixture(0, 0, 0, 200_000_000, 0);
+        // 300 ms elapsed since the last update (ts in nanoseconds) > 200 ms.
+        let (program_id, ix, accounts) = stale_swap_fixture(0, 0, 0, 300_000_000, 0);
         mollusk(&program_id).process_and_validate_instruction(
             &ix,
             &accounts,
@@ -1010,7 +1014,7 @@ mod test {
     fn swap_succeeds_with_fresh_oracle() {
         // Batch clock slot (10) is current with the warped syscall slot (10),
         // and the oracle mid was updated 50 ms ago (timestamps in ns), within
-        // the 100 ms tolerance.
+        // the 200 ms tolerance.
         let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 0);
         let mut m = mollusk(&program_id);
         m.warp_to_slot(10);

@@ -11,7 +11,7 @@ bAMM will write sub-slot timestamps to the batch clock account if the batch cloc
 
 For demonstration purposes swaps are only allowed against this program's liquidity pool if:
 * The batch clock account is being written to this slot by a trusted signer
-* The latest update is no more than 100ms old
+* The latest update is no more than 200ms old
 
 ## CLI
 

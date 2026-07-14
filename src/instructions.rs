@@ -1,5 +1,5 @@
 use crate::error::PammError;
-use crate::state::Pool;
+use crate::state::{BatchClock, Pool};
 use pinocchio::cpi::{Seed, Signer};
 use pinocchio::sysvars::{clock::Clock, rent::Rent, Sysvar};
 use pinocchio::{AccountView, Address, ProgramResult};
@@ -435,11 +435,15 @@ pub struct UpdateOracle;
 pub const SLOT_SOURCE: Address =
     Address::from_str_const("BPBFyBVuqnCTHuxQB6GmS8FxFq3JLvep8WfNXXfp1u8X");
 
-/// Byte offset of the batch clock account's current slot (u64 LE).
-pub const BATCH_CLOCK_SLOT_OFFSET: usize = 48;
-/// Byte offset of the batch clock account's current Unix timestamp, in
-/// nanoseconds (i64 LE).
-pub const BATCH_CLOCK_TIMESTAMP_OFFSET: usize = 64;
+/// Batch clock signers we trust to publish honest slot/timestamp readings. We
+/// only copy the batch clock's ms time and slot when the `slot_owner` recorded
+/// in the batch clock header is one of these keys. The batch clock is an open
+/// standard: any trusted block builder can adapt it and, once added here, have
+/// their readings honoured by this program.
+#[allow(non_upper_case_globals)]
+pub const trusted_signers: [Address; 1] = [Address::from_str_const(
+    "BAMgx3XPWrXkNUuQiVWUZU6eB2HQZdwz9HNnT4tpo8LG",
+)];
 
 /// Maximum permitted age of the oracle mid, in milliseconds. Swaps require the
 /// batch clock slot to be current, so age is always judged in wall-clock time.
@@ -507,6 +511,14 @@ impl Instruction for UpdateOracle {
         // at their known offsets. This skips the full wincode (de)serialize
         // round-trip to save CU and stay competitive in the scheduler.
         let mut data = pool.try_borrow_mut()?;
+        // Read the previous update timestamp before overwriting it so we can
+        // report how long it has been since the last successful update.
+        let prev_timestamp = i64::from_le_bytes(
+            data.get(Pool::TIMESTAMP_OFFSET..Pool::TIMESTAMP_OFFSET + 8)
+                .ok_or(ProgramError::InvalidAccountData)?
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
         data.get_mut(Pool::MID_OFFSET..Pool::MID_OFFSET + 16)
             .ok_or(ProgramError::InvalidAccountData)?
             .copy_from_slice(&mid_bytes);
@@ -516,6 +528,22 @@ impl Instruction for UpdateOracle {
         data.get_mut(Pool::TIMESTAMP_OFFSET..Pool::TIMESTAMP_OFFSET + 8)
             .ok_or(ProgramError::InvalidAccountData)?
             .copy_from_slice(&timestamp.to_le_bytes());
+        drop(data);
+
+        // Only report elapsed time within a single slot: the batch clock slot
+        // (carried in the instruction data) must equal the current syscall clock
+        // slot. Time measured across slots isn't meaningful here, so skip it.
+        if slot == Clock::get()?.slot {
+            // Timestamps are Unix nanoseconds. A `prev_timestamp` of 0 means this
+            // is the first update since InitPool (no prior reading to measure
+            // against).
+            if prev_timestamp == 0 {
+                log!("Oracle updated (first update)");
+            } else {
+                let elapsed_ms = timestamp.saturating_sub(prev_timestamp) / 1_000_000;
+                log!("Oracle updated ({} ms since last update)", elapsed_ms);
+            }
+        }
         Ok(())
     }
 }
@@ -626,7 +654,7 @@ impl Instruction for Swap {
 
         // Staleness gate: swaps are only permitted when the batch clock slot is
         // current (equal to the syscall clock slot) and the oracle mid is no
-        // older than 100 ms.
+        // older than 200 ms.
         //
         // Requiring the batch clock to be current gives us a trustworthy
         // wall-clock reading, so we judge the mid's age in milliseconds
@@ -634,26 +662,39 @@ impl Instruction for Swap {
         // syscall clock we reject the swap outright.
         let current_slot = Clock::get()?.slot;
         let batch_data = batch_clock.try_borrow()?;
-        let batch_slot = u64::from_le_bytes(
-            batch_data
-                .get(BATCH_CLOCK_SLOT_OFFSET..BATCH_CLOCK_SLOT_OFFSET + 8)
-                .ok_or(ProgramError::InvalidAccountData)?
-                .try_into()
-                .map_err(|_| ProgramError::InvalidAccountData)?,
-        );
-        let batch_timestamp = i64::from_le_bytes(
-            batch_data
-                .get(BATCH_CLOCK_TIMESTAMP_OFFSET..BATCH_CLOCK_TIMESTAMP_OFFSET + 8)
-                .ok_or(ProgramError::InvalidAccountData)?
-                .try_into()
-                .map_err(|_| ProgramError::InvalidAccountData)?,
-        );
+        // Deserialize the batch clock with wincode (validates the discriminator)
+        // rather than reading fields by byte offset.
+        let batch = BatchClock::load(&batch_data)?;
         drop(batch_data);
+
+        // Only copy the batch clock's ms time and slot when its `slot_owner` is
+        // one of the `trusted_signers`. This is an open standard: any trusted
+        // block builder can adapt this batch clock and, once their key is in
+        // `trusted_signers`, have their readings honoured here.
+        if !trusted_signers
+            .iter()
+            .any(|s| s.as_ref() == batch.slot_owner)
+        {
+            return Err(PammError::BlockBuilderNotTrusted.into());
+        }
+
+        let batch_slot = batch.slot;
+        let batch_timestamp = batch.timestamp_ns;
+        let batch_sequence = batch.sequence;
 
         if current_slot != batch_slot {
             return Err(PammError::StaleQuoteSlots.into());
         }
-        let elapsed_ms = batch_timestamp.saturating_sub(last_updated_timestamp) / 1_000_000;
+        // A batch clock `sequence` of 0 on the current slot marks the slot's
+        // first tick: the reading was taken at the very start of the slot, so
+        // the oracle update age is exactly 0 ms. (The slot equality required
+        // above already guarantees the batch slot matches the syscall clock
+        // slot.) Skip the millisecond diff and treat the quote as fresh.
+        let elapsed_ms = if batch_sequence == 0 {
+            0
+        } else {
+            batch_timestamp.saturating_sub(last_updated_timestamp) / 1_000_000
+        };
         if elapsed_ms > MAX_QUOTE_AGE_MS {
             log!(
                 "StaleQuoteMillis: batch_timestamp {} ns, last_updated_timestamp {} ns, elapsed {} ms > {} ms",
