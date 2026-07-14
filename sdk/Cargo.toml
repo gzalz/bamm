@@ -1,0 +1,12 @@
+[package]
+name = "jitosol-pamm-sdk"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "jitosol_pamm_sdk"
+crate-type = ["lib"]
+
+[dependencies]
+solana-sdk = "3.0.0"
+solana-program = "3.0.0"

@@ -1,0 +1,16 @@
+[package]
+name = "bamm-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bamm"
+path = "src/main.rs"
+
+[dependencies]
+jitosol-pamm-sdk = { path = "../sdk" }
+solana-client = "3.0.0"
+solana-sdk = "3.0.0"
+solana-commitment-config = "3"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
