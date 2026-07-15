@@ -242,11 +242,13 @@ mod test {
         let mid = 2u128 << 64;
         let timestamp = 1_700_000_000i64;
 
-        // Instruction data: discriminator(8) + mid(16). The slot and timestamp
-        // are copied from the trusted batch-clock account by the program.
-        let mut data = vec![0u8; 24];
+        // Instruction data: discriminator(8) + mid(16) + sequence(8). The slot
+        // and timestamp are copied from the trusted batch-clock account by the
+        // program.
+        let mut data = vec![0u8; 32];
         data[0..8].copy_from_slice(&UpdateOracle::DISCRIMINATOR);
         data[8..24].copy_from_slice(&mid.to_le_bytes());
+        data[24..32].copy_from_slice(&1u64.to_le_bytes());
 
         let ix = Instruction::new_with_bytes(
             program_id,
@@ -984,7 +986,7 @@ mod test {
         use crate::error::PammError;
         // Batch clock and syscall clock agree on slot 0, and the batch is past
         // the slot's first tick (sequence 1), so age is judged in ms.
-        // 300 ms elapsed since the last update (ts in nanoseconds) > 200 ms.
+        // 300 ms elapsed since the last update (ts in nanoseconds) > 100 ms.
         let (program_id, ix, accounts) = stale_swap_fixture(0, 0, 0, 300_000_000, 1, 0);
         mollusk(&program_id).process_and_validate_instruction(
             &ix,
@@ -1016,7 +1018,7 @@ mod test {
     fn swap_succeeds_with_fresh_oracle() {
         // Batch clock slot (10) is current with the warped syscall slot (10),
         // past the first tick (sequence 1), and the oracle mid was updated 50 ms
-        // ago (timestamps in ns), within the 200 ms tolerance — so the ms-diff
+        // ago (timestamps in ns), within the 100 ms tolerance — so the ms-diff
         // path clears the gate.
         let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 1, 0);
         let mut m = mollusk(&program_id);
@@ -1054,26 +1056,30 @@ mod test {
     }
 
     #[test]
-    fn swap_succeeds_on_first_tick_shortcut() {
-        // sequence 0 with pool.last_updated_slot == batch.slot == syscall slot
-        // (all 10) marks a fresh, in-slot update, so the quote is treated as
-        // 0 ms old even though the batch timestamp is 999 ms past the oracle's
-        // last update. The ms-diff path would reject this; the shortcut clears
-        // it, proving the shortcut fired.
+    fn swap_fails_on_first_tick_when_timestamp_is_stale() {
+        use crate::error::PammError;
+        // sequence 0 does not override timestamp staleness. If the pool's
+        // oracle timestamp is older than the current batch timestamp, the
+        // quote age is judged directly from that difference.
         let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 999_000_000, 0, 0);
         let mut m = mollusk(&program_id);
         m.warp_to_slot(10);
-        m.process_and_validate_instruction(&ix, &accounts, &[Check::success()]);
+        m.process_and_validate_instruction(
+            &ix,
+            &accounts,
+            &[Check::err(solana_sdk::program_error::ProgramError::Custom(
+                PammError::StaleQuoteMillis as u32,
+            ))],
+        );
     }
 
     #[test]
     fn swap_fails_when_first_tick_but_oracle_from_prior_slot() {
         use crate::error::PammError;
-        // sequence 0 alone is NOT enough for the 0 ms shortcut: the oracle mid
-        // was last updated in slot 9 while the batch clock and syscall clock are
-        // on slot 10. Because pool.last_updated_slot (9) != current slot (10),
-        // the shortcut must be skipped and the age judged in ms — 300 ms since
-        // the last update > 200 ms, so the swap is rejected as stale.
+        // sequence 0 alone does not make the oracle fresh: the oracle mid was
+        // last updated in slot 9 while the batch clock and syscall clock are on
+        // slot 10. The age is judged in ms, so 300 ms since the last update is
+        // stale.
         let (program_id, ix, accounts) = stale_swap_fixture(9, 0, 10, 300_000_000, 0, 0);
         let mut m = mollusk(&program_id);
         m.warp_to_slot(10);

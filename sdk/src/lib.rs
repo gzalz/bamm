@@ -206,10 +206,11 @@ pub fn update_oracle(
     slot_source: &Pubkey,
     mid: u128,
 ) -> Instruction {
-    // Layout: discriminator(8) + mid(16).
-    let mut data = vec![0u8; 24];
+    // Layout: discriminator(8) + mid(16) + sequence(8).
+    let mut data = vec![0u8; 32];
     data[0..8].copy_from_slice(&discriminators::UPDATE_ORACLE);
     data[8..24].copy_from_slice(&mid.to_le_bytes());
+    data[24..32].copy_from_slice(&1u64.to_le_bytes());
 
     Instruction {
         program_id: *program_id,
@@ -371,9 +372,10 @@ mod tests {
         let ix = update_oracle(&program_id, &authority, &pool, &slot_source, mid);
         assert_eq!(ix.program_id, program_id);
         assert_eq!(ix.accounts.len(), 3);
-        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.data.len(), 32);
         assert_eq!(ix.data[0..8], discriminators::UPDATE_ORACLE);
         assert_eq!(ix.data[8..24], mid.to_le_bytes());
+        assert_eq!(ix.data[24..32], 1u64.to_le_bytes());
     }
 
     #[test]

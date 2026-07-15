@@ -457,7 +457,8 @@ impl Instruction for UpdateOracle {
         accounts: &[AccountView],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        // Instruction data layout: discriminator(8) + mid(16).
+        // Minimum instruction data layout: discriminator(8) + mid(16).
+        // Additional trailing bytes are accepted for client compatibility.
         const MID_OFFSET: usize = 8;
         const MID_END: usize = MID_OFFSET + 16;
 
@@ -531,14 +532,25 @@ impl Instruction for UpdateOracle {
             .copy_from_slice(&timestamp.to_le_bytes());
         drop(data);
 
-        // Timestamps are Unix nanoseconds. A `prev_timestamp` of 0 means this
-        // is the first update since InitPool (no prior reading to measure
-        // against).
+        // Timestamps are Unix nanoseconds. For non-initial updates, log the
+        // duration between the timestamp we just wrote from the batch clock and
+        // the timestamp that was already stored on the pool account.
         if prev_timestamp == 0 {
-            log!("Oracle updated (first update)");
+            log!(
+                "OracleUpdateDuration: written_timestamp {} ns, previous_timestamp {} ns, first_update",
+                timestamp,
+                prev_timestamp
+            );
         } else {
-            let elapsed_ms = timestamp.saturating_sub(prev_timestamp) / 1_000_000;
-            log!("Oracle updated ({} ms since last update)", elapsed_ms);
+            let elapsed_ns = timestamp.saturating_sub(prev_timestamp);
+            let elapsed_ms = elapsed_ns / 1_000_000;
+            log!(
+                "OracleUpdateDuration: written_timestamp {} ns, previous_timestamp {} ns, elapsed {} ns ({} ms)",
+                timestamp,
+                prev_timestamp,
+                elapsed_ns,
+                elapsed_ms
+            );
         }
         Ok(())
     }
@@ -651,7 +663,7 @@ impl Instruction for Swap {
 
         // Staleness gate: swaps are only permitted when the batch clock slot is
         // current (equal to the syscall clock slot) and the oracle mid is no
-        // older than 200 ms.
+        // older than MAX_QUOTE_AGE_MS.
         //
         // Requiring the batch clock to be current gives us a trustworthy
         // wall-clock reading, so we judge the mid's age in milliseconds
@@ -682,27 +694,7 @@ impl Instruction for Swap {
         if current_slot != batch_slot {
             return Err(PammError::StaleQuoteSlots.into());
         }
-        // A batch clock `sequence` of 0 marks the slot's first tick: the reading
-        // was taken at the very start of the slot. That alone does NOT make the
-        // quote fresh — it only means the *clock* is at the slot boundary. The
-        // 0 ms shortcut is sound only when the oracle mid was itself updated in
-        // this same slot. So we require all three slots to agree:
-        //
-        //   pool.last_updated_slot == batch.slot == syscall Clock::slot
-        //
-        // The `current_slot != batch_slot` guard above already pins
-        // batch_slot == current_slot; here we additionally require the oracle's
-        // last-updated slot to match. Only then is a sequence of 0 proof of a
-        // fresh (0 ms old) update. Otherwise the mid was written in a prior slot
-        // and we fall through to the real millisecond diff.
-        let elapsed_ms = if batch_sequence == 0
-            && last_updated_slot == batch_slot
-            && last_updated_slot == current_slot
-        {
-            0
-        } else {
-            batch_timestamp.saturating_sub(last_updated_timestamp) / 1_000_000
-        };
+        let elapsed_ms = batch_timestamp.saturating_sub(last_updated_timestamp) / 1_000_000;
         if elapsed_ms > MAX_QUOTE_AGE_MS {
             log!(
                 "StaleQuoteMillis: batch_sequence {}, batch_slot {}, syscall_slot {}, pool_last_updated_slot {}, batch_timestamp {} ns, last_updated_timestamp {} ns, elapsed {} ms > {} ms",
