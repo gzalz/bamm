@@ -28,6 +28,7 @@ Sub-slot timing logic work best with sub-slot scheduling features. [Jito's BAM M
 * Enhanced shred / pre-conf data, notion of builder batches propagated in real-time
 
 ## On-chain Data
+[(MPP + Batch Clock) per Batch Scheduling](https://explorer.solana.com/block/422144963?cluster=testnet)\
 [BAM Block Builder Signer](https://explorer.solana.com/address/BAMgx3XPWrXkNUuQiVWUZU6eB2HQZdwz9HNnT4tpo8LG?cluster=testnet)\
 [Batch Clock Update Block](https://explorer.solana.com/block/422143302?cluster=testnet)\
 [Successful Swap (47ms quote age)](https://explorer.solana.com/tx/3KAZujeaZFHZpbTjZFjU15SVYTuXtMjujHpgLUyYZyojPHbBSDNoQ7XiSgZkaST5kextazMeZURkNpJJBqLJPT11?cluster=testnet)\
