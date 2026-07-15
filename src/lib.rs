@@ -99,8 +99,9 @@ mod test {
 
     // The batch clock account, in the open batch-clock layout: "BATCHCLK"
     // discriminator at offset 0, the trusted `slot_owner` at offset 16, slot
-    // (u64 LE) at offset 48, and timestamp_ns (i64 LE) at offset 64.
-    fn batch_clock_account(slot: u64, timestamp_nanos: i64) -> (Pubkey, Account) {
+    // (u64 LE) at offset 48, timestamp_ns (i64 LE) at offset 64, and the
+    // in-slot sequence (u64 LE) at offset 72.
+    fn batch_clock_account(slot: u64, timestamp_nanos: i64, sequence: u64) -> (Pubkey, Account) {
         use crate::instructions::{trusted_signers, SLOT_SOURCE};
         let mut data = vec![0u8; 96];
         data[0..8].copy_from_slice(b"BATCHCLK");
@@ -108,6 +109,7 @@ mod test {
         data[16..48].copy_from_slice(trusted_signers[0].as_ref());
         data[48..56].copy_from_slice(&slot.to_le_bytes());
         data[64..72].copy_from_slice(&timestamp_nanos.to_le_bytes());
+        data[72..80].copy_from_slice(&sequence.to_le_bytes());
         (
             Pubkey::new_from_array(SLOT_SOURCE.to_bytes()),
             Account {
@@ -238,16 +240,13 @@ mod test {
         let pool = Pubkey::new_unique();
         let slot_source = Pubkey::new_from_array(SLOT_SOURCE.to_bytes());
         let mid = 2u128 << 64;
-        let slot = 123_456u64;
         let timestamp = 1_700_000_000i64;
 
-        // Instruction data: discriminator(8) + mid(16), zero-padded so the slot
-        // (u64 LE) lands at offset 48 and the timestamp (i64 LE) at offset 64.
-        let mut data = vec![0u8; 72];
+        // Instruction data: discriminator(8) + mid(16). The slot and timestamp
+        // are copied from the trusted batch-clock account by the program.
+        let mut data = vec![0u8; 24];
         data[0..8].copy_from_slice(&UpdateOracle::DISCRIMINATOR);
         data[8..24].copy_from_slice(&mid.to_le_bytes());
-        data[48..56].copy_from_slice(&slot.to_le_bytes());
-        data[64..72].copy_from_slice(&timestamp.to_le_bytes());
 
         let ix = Instruction::new_with_bytes(
             program_id,
@@ -269,7 +268,7 @@ mod test {
                 },
             ),
             (pool, pool_account(&program_id, 0)),
-            (slot_source, Account::default()),
+            (slot_source, batch_clock_account(0, timestamp, 0).1),
         ];
 
         mollusk(&program_id).process_and_validate_instruction(
@@ -279,7 +278,7 @@ mod test {
                 Check::success(),
                 Check::account(&pool)
                     .data_slice(Pool::MID_OFFSET, &mid.to_le_bytes())
-                    .data_slice(Pool::SLOT_OFFSET, &slot.to_le_bytes())
+                    .data_slice(Pool::SLOT_OFFSET, &0u64.to_le_bytes())
                     .data_slice(Pool::TIMESTAMP_OFFSET, &timestamp.to_le_bytes())
                     .build(),
             ],
@@ -312,7 +311,7 @@ mod test {
         data.push(vault_bump);
         data.extend_from_slice(&0u64.to_le_bytes()); // min_tokens_out (no floor)
 
-        let (batch_clock, batch_clock_acc) = batch_clock_account(0, 0);
+        let (batch_clock, batch_clock_acc) = batch_clock_account(0, 0, 0);
 
         let ix = Instruction::new_with_bytes(
             program_id,
@@ -433,7 +432,7 @@ mod test {
         data.push(vault_bump);
         data.extend_from_slice(&0u64.to_le_bytes()); // min_tokens_out (no floor)
 
-        let (batch_clock, batch_clock_acc) = batch_clock_account(0, 0);
+        let (batch_clock, batch_clock_acc) = batch_clock_account(0, 0, 0);
 
         let ix = Instruction::new_with_bytes(
             program_id,
@@ -536,6 +535,7 @@ mod test {
         pool_ts: i64,
         batch_slot: u64,
         batch_ts: i64,
+        batch_sequence: u64,
         min_tokens_out: u64,
     ) -> (Pubkey, Instruction, Vec<(Pubkey, Account)>) {
         let program_id = Pubkey::new_unique();
@@ -559,7 +559,8 @@ mod test {
         data.push(vault_bump);
         data.extend_from_slice(&min_tokens_out.to_le_bytes());
 
-        let (batch_clock, batch_clock_acc) = batch_clock_account(batch_slot, batch_ts);
+        let (batch_clock, batch_clock_acc) =
+            batch_clock_account(batch_slot, batch_ts, batch_sequence);
 
         let ix = Instruction::new_with_bytes(
             program_id,
@@ -981,9 +982,10 @@ mod test {
     #[test]
     fn swap_fails_on_stale_millis() {
         use crate::error::PammError;
-        // Batch clock and syscall clock agree on slot 0, so age is judged in ms.
+        // Batch clock and syscall clock agree on slot 0, and the batch is past
+        // the slot's first tick (sequence 1), so age is judged in ms.
         // 300 ms elapsed since the last update (ts in nanoseconds) > 200 ms.
-        let (program_id, ix, accounts) = stale_swap_fixture(0, 0, 0, 300_000_000, 0);
+        let (program_id, ix, accounts) = stale_swap_fixture(0, 0, 0, 300_000_000, 1, 0);
         mollusk(&program_id).process_and_validate_instruction(
             &ix,
             &accounts,
@@ -998,7 +1000,7 @@ mod test {
         use crate::error::PammError;
         // Batch clock slot (3) lags the warped syscall slot (10), so age is
         // judged in slots: 10 - 5 = 5 slots since the last update > 1 slot.
-        let (program_id, ix, accounts) = stale_swap_fixture(5, 0, 3, 0, 0);
+        let (program_id, ix, accounts) = stale_swap_fixture(5, 0, 3, 0, 0, 0);
         let mut m = mollusk(&program_id);
         m.warp_to_slot(10);
         m.process_and_validate_instruction(
@@ -1013,9 +1015,10 @@ mod test {
     #[test]
     fn swap_succeeds_with_fresh_oracle() {
         // Batch clock slot (10) is current with the warped syscall slot (10),
-        // and the oracle mid was updated 50 ms ago (timestamps in ns), within
-        // the 200 ms tolerance.
-        let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 0);
+        // past the first tick (sequence 1), and the oracle mid was updated 50 ms
+        // ago (timestamps in ns), within the 200 ms tolerance — so the ms-diff
+        // path clears the gate.
+        let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 1, 0);
         let mut m = mollusk(&program_id);
         m.warp_to_slot(10);
         m.process_and_validate_instruction(&ix, &accounts, &[Check::success()]);
@@ -1028,7 +1031,7 @@ mod test {
         // the staleness gate. amount_in = 1_000_000 at mid = 1.0 yields
         // 999_900 out after the 1 bps spread. A min_tokens_out floor of
         // 1_000_000 is unreachable, so the swap is rejected on-chain.
-        let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 1_000_000);
+        let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 1, 1_000_000);
         let mut m = mollusk(&program_id);
         m.warp_to_slot(10);
         m.process_and_validate_instruction(
@@ -1044,9 +1047,42 @@ mod test {
     fn swap_succeeds_when_output_meets_floor() {
         // Same fresh oracle; the 999_900 output exactly meets a 999_900 floor,
         // so the slippage check passes.
-        let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 999_900);
+        let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 50_000_000, 1, 999_900);
         let mut m = mollusk(&program_id);
         m.warp_to_slot(10);
         m.process_and_validate_instruction(&ix, &accounts, &[Check::success()]);
+    }
+
+    #[test]
+    fn swap_succeeds_on_first_tick_shortcut() {
+        // sequence 0 with pool.last_updated_slot == batch.slot == syscall slot
+        // (all 10) marks a fresh, in-slot update, so the quote is treated as
+        // 0 ms old even though the batch timestamp is 999 ms past the oracle's
+        // last update. The ms-diff path would reject this; the shortcut clears
+        // it, proving the shortcut fired.
+        let (program_id, ix, accounts) = stale_swap_fixture(10, 0, 10, 999_000_000, 0, 0);
+        let mut m = mollusk(&program_id);
+        m.warp_to_slot(10);
+        m.process_and_validate_instruction(&ix, &accounts, &[Check::success()]);
+    }
+
+    #[test]
+    fn swap_fails_when_first_tick_but_oracle_from_prior_slot() {
+        use crate::error::PammError;
+        // sequence 0 alone is NOT enough for the 0 ms shortcut: the oracle mid
+        // was last updated in slot 9 while the batch clock and syscall clock are
+        // on slot 10. Because pool.last_updated_slot (9) != current slot (10),
+        // the shortcut must be skipped and the age judged in ms — 300 ms since
+        // the last update > 200 ms, so the swap is rejected as stale.
+        let (program_id, ix, accounts) = stale_swap_fixture(9, 0, 10, 300_000_000, 0, 0);
+        let mut m = mollusk(&program_id);
+        m.warp_to_slot(10);
+        m.process_and_validate_instruction(
+            &ix,
+            &accounts,
+            &[Check::err(solana_sdk::program_error::ProgramError::Custom(
+                PammError::StaleQuoteMillis as u32,
+            ))],
+        );
     }
 }

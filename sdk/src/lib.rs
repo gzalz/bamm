@@ -196,29 +196,20 @@ pub fn set_authority(
     }
 }
 
-/// Update the oracle mid-price (Q64.64) stored in the pool account, recording
-/// the `slot` and `timestamp` (Unix nanoseconds) the mid was observed at.
-///
-/// The instruction data is zero-padded so the program can read the mid at
-/// offset 8, the slot (u64 LE) at offset 48, and the timestamp (i64 LE) at
-/// offset 64. `slot_source` must be the [`SLOT_SOURCE`] account; the program
-/// asserts its pubkey to authorize the update.
+/// Update the oracle mid-price (Q64.64) stored in the pool account. The
+/// program records the slot and timestamp directly from `slot_source`, which
+/// must be the trusted [`SLOT_SOURCE`] batch-clock account.
 pub fn update_oracle(
     program_id: &Pubkey,
     authority: &Pubkey,
     pool: &Pubkey,
     slot_source: &Pubkey,
     mid: u128,
-    slot: u64,
-    timestamp: i64,
 ) -> Instruction {
-    // Layout the program reads: discriminator(8) + mid(16) at offset 8, slot
-    // (u64 LE) at offset 48, timestamp (i64 LE) at offset 64. Total 72 bytes.
-    let mut data = vec![0u8; 72];
+    // Layout: discriminator(8) + mid(16).
+    let mut data = vec![0u8; 24];
     data[0..8].copy_from_slice(&discriminators::UPDATE_ORACLE);
     data[8..24].copy_from_slice(&mid.to_le_bytes());
-    data[48..56].copy_from_slice(&slot.to_le_bytes());
-    data[64..72].copy_from_slice(&timestamp.to_le_bytes());
 
     Instruction {
         program_id: *program_id,
@@ -377,14 +368,12 @@ mod tests {
         let slot_source = Pubkey::new_unique();
 
         let mid = 1u128 << 64;
-        let ix = update_oracle(&program_id, &authority, &pool, &slot_source, mid, 123, 456);
+        let ix = update_oracle(&program_id, &authority, &pool, &slot_source, mid);
         assert_eq!(ix.program_id, program_id);
         assert_eq!(ix.accounts.len(), 3);
-        assert_eq!(ix.data.len(), 72);
+        assert_eq!(ix.data.len(), 24);
         assert_eq!(ix.data[0..8], discriminators::UPDATE_ORACLE);
         assert_eq!(ix.data[8..24], mid.to_le_bytes());
-        assert_eq!(ix.data[48..56], 123u64.to_le_bytes());
-        assert_eq!(ix.data[64..72], 456i64.to_le_bytes());
     }
 
     #[test]

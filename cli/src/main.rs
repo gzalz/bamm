@@ -205,12 +205,6 @@ struct UpdateOracleArgs {
     /// Pool account. Defaults to the derived pool PDA.
     #[arg(long)]
     pool: Option<String>,
-    /// Observation slot to record. Defaults to the current RPC slot.
-    #[arg(long)]
-    slot: Option<u64>,
-    /// Observation timestamp in Unix nanoseconds. Defaults to the local clock.
-    #[arg(long)]
-    timestamp_nanos: Option<i64>,
 }
 
 /// Which token the taker pays in. The other leg is received.
@@ -257,6 +251,14 @@ struct SwapArgs {
     /// Submit without the interactive confirmation prompt.
     #[arg(long)]
     no_confirm: bool,
+    /// Keep sending swaps continuously until interrupted with Ctrl+C. Each swap
+    /// re-fetches a fresh blockhash, re-signs, and is fired without waiting for
+    /// confirmation; send failures are logged and the loop continues.
+    #[arg(long)]
+    repeat: bool,
+    /// Delay between swaps in --repeat mode, in milliseconds.
+    #[arg(long, default_value_t = 0)]
+    repeat_delay_ms: u64,
     /// Leader TPU address (host:port) to fan the signed transaction to over
     /// QUIC, bypassing the RPC node. The transaction is sent in the TPU QUIC
     /// wire format straight to this socket.
@@ -439,26 +441,14 @@ fn cmd_update_oracle(g: &GlobalOpts, program_id: &Pubkey, args: &UpdateOracleArg
         bail!("mid must be non-zero");
     }
 
-    let client = rpc_client(g)?;
-    let slot = match args.slot {
-        Some(s) => s,
-        None => client.get_slot().context("fetching current slot")?,
-    };
-    let timestamp = match args.timestamp_nanos {
-        Some(t) => t,
-        None => now_unix_nanos()?,
-    };
-
     let ix = sdk::update_oracle(
         program_id,
         &authority.pubkey(),
         &pool,
         &slot_source,
         mid,
-        slot,
-        timestamp,
     );
-    submit_with_client(g, &client, ix, &authority, false, false, None)
+    submit(g, ix, &authority)
 }
 
 fn cmd_swap(g: &GlobalOpts, program_id: &Pubkey, args: &SwapArgs) -> Result<()> {
@@ -500,13 +490,16 @@ fn cmd_swap(g: &GlobalOpts, program_id: &Pubkey, args: &SwapArgs) -> Result<()> 
         println!("  pay in         {} {pay}", args.amount_in);
         println!("  receive        {recv} (min {})", args.min_tokens_out);
         println!("  signer         {}", signer.pubkey());
+        if args.repeat {
+            println!("  mode           repeat until cancelled (Ctrl+C)");
+        }
         if !confirm("proceed with swap?")? {
             println!("aborted");
             return Ok(());
         }
     }
 
-    let ix = sdk::swap(
+    let mut ix = sdk::swap(
         program_id,
         &signer.pubkey(),
         &pool,
@@ -530,7 +523,126 @@ fn cmd_swap(g: &GlobalOpts, program_id: &Pubkey, args: &SwapArgs) -> Result<()> 
     // are noise rather than signal here. It also sends the signed transaction
     // straight to the leader's TPU port over QUIC rather than relaying through
     // the RPC node, to shave latency off landing.
+    if args.repeat {
+        if g.simulate {
+            bail!("--repeat cannot be combined with --simulate");
+        }
+        return send_swaps_until_cancelled(
+            g,
+            ix,
+            &signer,
+            Some(tpu_address),
+            args.repeat_delay_ms,
+        );
+    }
+    // Append a nonce byte so the instruction data (and therefore the signed
+    // transaction) is unique, even if an identical swap is fired again against
+    // the same recent blockhash. The on-chain Swap handler reads only the first
+    // 26 bytes and ignores the trailing nonce.
+    ix.data.push(nonce_byte());
     submit_with_opts(g, ix, &signer, true, args.no_confirm, Some(tpu_address))
+}
+
+/// Fire swaps back-to-back until the process is interrupted (Ctrl+C). Each
+/// iteration re-fetches a fresh blockhash and re-signs so consecutive swaps are
+/// distinct transactions that won't be deduped by the network, then sends them
+/// fire-and-forget. Transient send/blockhash errors are logged and the loop
+/// keeps going — only Ctrl+C stops it.
+fn send_swaps_until_cancelled(
+    g: &GlobalOpts,
+    ix: solana_sdk::instruction::Instruction,
+    signer: &Keypair,
+    tpu_address: Option<SocketAddr>,
+    delay_ms: u64,
+) -> Result<()> {
+    let client = rpc_client(g)?;
+
+    // Open the QUIC connection cache once and reuse it across every swap so we
+    // don't pay the TPU handshake per send.
+    let tpu = tpu_address.map(|addr| (ConnectionCache::new("bamm-cli-tpu"), addr));
+
+    println!("sending swaps until cancelled (Ctrl+C to stop)...");
+    let mut sent: u64 = 0;
+    let mut failed: u64 = 0;
+    loop {
+        let blockhash = match client.get_latest_blockhash() {
+            Ok(b) => b,
+            Err(e) => {
+                failed += 1;
+                eprintln!("blockhash fetch failed: {e:#}");
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms.max(200)));
+                continue;
+            }
+        };
+        // Append a fresh nonce byte per iteration so consecutive swaps produce
+        // distinct instruction data — and thus distinct signatures — even when
+        // the RPC hands back the same recent blockhash. Without this the network
+        // would dedupe back-to-back identical swaps. The on-chain Swap handler
+        // reads only the first 26 bytes and ignores the trailing nonce.
+        let mut ix = ix.clone();
+        ix.data.push(nonce_byte());
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            blockhash,
+        );
+
+        let result = if let Some((cache, addr)) = &tpu {
+            match bincode::serialize(&tx) {
+                Ok(wire) => cache
+                    .get_connection(addr)
+                    .send_data(&wire)
+                    .map(|()| tx.signatures[0])
+                    .map_err(|e| anyhow!(e).context("sending transaction to TPU over QUIC")),
+                Err(e) => Err(anyhow!(e).context("serializing transaction")),
+            }
+        } else {
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            };
+            client
+                .send_transaction_with_config(&tx, config)
+                .context("submitting transaction")
+        };
+
+        match result {
+            Ok(sig) => {
+                sent += 1;
+                println!("[{sent}] {sig}");
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("swap failed: {e:#} (sent {sent}, failed {failed})");
+            }
+        }
+
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
+}
+
+/// A per-call nonce byte appended to swap instruction data so that otherwise
+/// identical swaps serialize to distinct transactions (and signatures), letting
+/// consecutive sends survive network dedup even against the same blockhash.
+///
+/// A monotonically increasing counter guarantees no two calls within any window
+/// of 256 collide; it starts from a wall-clock-derived seed so the sequence's
+/// starting value varies run to run.
+fn nonce_byte() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::OnceLock;
+    static SEED: OnceLock<u8> = OnceLock::new();
+    static COUNTER: AtomicU8 = AtomicU8::new(0);
+    let seed = *SEED.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u8)
+            .unwrap_or(0)
+    });
+    seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 // --- Transaction plumbing ---------------------------------------------------

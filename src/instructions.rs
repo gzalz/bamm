@@ -429,9 +429,8 @@ impl Instruction for SetAuthority {
 
 pub struct UpdateOracle;
 
-/// Read-only account that must be present (and match this pubkey) to authorize
-/// an oracle update. Its presence lets the caller supply the slot/timestamp the
-/// mid was observed at, which are recorded on the pool state.
+/// Read-only batch-clock account that supplies the slot/timestamp recorded with
+/// each oracle update.
 pub const SLOT_SOURCE: Address =
     Address::from_str_const("BPBFyBVuqnCTHuxQB6GmS8FxFq3JLvep8WfNXXfp1u8X");
 
@@ -458,17 +457,11 @@ impl Instruction for UpdateOracle {
         accounts: &[AccountView],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        // Instruction data layout: discriminator(8) + mid(16) + ... with the
-        // update slot (u64 LE) at offset 48 and the update timestamp
-        // (i64 LE) at offset 64.
+        // Instruction data layout: discriminator(8) + mid(16).
         const MID_OFFSET: usize = 8;
         const MID_END: usize = MID_OFFSET + 16;
-        const SLOT_OFFSET: usize = 48;
-        const SLOT_END: usize = SLOT_OFFSET + 8;
-        const TIMESTAMP_OFFSET: usize = 64;
-        const TIMESTAMP_END: usize = TIMESTAMP_OFFSET + 8;
 
-        if instruction_data.len() < TIMESTAMP_END {
+        if instruction_data.len() < MID_END {
             return Err(ProgramError::InvalidInstructionData);
         }
 
@@ -483,9 +476,25 @@ impl Instruction for UpdateOracle {
         if !pool.is_writable() {
             return Err(ProgramError::InvalidAccountData);
         }
-        // Read-only account: assert its pubkey, nothing else is required of it.
+        // The pool's observation time must come from the trusted batch clock,
+        // rather than an RPC/local value supplied in instruction data. An RPC
+        // node can be behind the leader, which would otherwise record a stale
+        // slot even when this update executes in the current slot.
         if slot_source.address() != &SLOT_SOURCE {
             return Err(ProgramError::InvalidAccountData);
+        }
+
+        let batch_data = slot_source.try_borrow()?;
+        let batch = BatchClock::load(&batch_data)?;
+        drop(batch_data);
+        if !trusted_signers
+            .iter()
+            .any(|s| s.as_ref() == batch.slot_owner)
+        {
+            return Err(PammError::BlockBuilderNotTrusted.into());
+        }
+        if batch.slot != Clock::get()?.slot {
+            return Err(PammError::StaleQuoteSlots.into());
         }
 
         let mid_bytes: [u8; 16] = instruction_data[MID_OFFSET..MID_END]
@@ -495,16 +504,8 @@ impl Instruction for UpdateOracle {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        let slot = u64::from_le_bytes(
-            instruction_data[SLOT_OFFSET..SLOT_END]
-                .try_into()
-                .map_err(|_| ProgramError::InvalidInstructionData)?,
-        );
-        let timestamp = i64::from_le_bytes(
-            instruction_data[TIMESTAMP_OFFSET..TIMESTAMP_END]
-                .try_into()
-                .map_err(|_| ProgramError::InvalidInstructionData)?,
-        );
+        let slot = batch.slot;
+        let timestamp = batch.timestamp_ns;
 
         // Hot path: the discriminator was written once at InitPool and never
         // changes, so overwrite only the `mid` and last-updated fields in place
@@ -530,19 +531,14 @@ impl Instruction for UpdateOracle {
             .copy_from_slice(&timestamp.to_le_bytes());
         drop(data);
 
-        // Only report elapsed time within a single slot: the batch clock slot
-        // (carried in the instruction data) must equal the current syscall clock
-        // slot. Time measured across slots isn't meaningful here, so skip it.
-        if slot == Clock::get()?.slot {
-            // Timestamps are Unix nanoseconds. A `prev_timestamp` of 0 means this
-            // is the first update since InitPool (no prior reading to measure
-            // against).
-            if prev_timestamp == 0 {
-                log!("Oracle updated (first update)");
-            } else {
-                let elapsed_ms = timestamp.saturating_sub(prev_timestamp) / 1_000_000;
-                log!("Oracle updated ({} ms since last update)", elapsed_ms);
-            }
+        // Timestamps are Unix nanoseconds. A `prev_timestamp` of 0 means this
+        // is the first update since InitPool (no prior reading to measure
+        // against).
+        if prev_timestamp == 0 {
+            log!("Oracle updated (first update)");
+        } else {
+            let elapsed_ms = timestamp.saturating_sub(prev_timestamp) / 1_000_000;
+            log!("Oracle updated ({} ms since last update)", elapsed_ms);
         }
         Ok(())
     }
@@ -646,6 +642,7 @@ impl Instruction for Swap {
         let pool_data = pool.try_borrow()?;
         let pool_state = Pool::load(&pool_data)?;
         let mid = pool_state.mid;
+        let last_updated_slot = pool_state.last_updated_slot;
         let last_updated_timestamp = pool_state.last_updated_timestamp;
         drop(pool_data);
         if mid == 0 {
@@ -685,19 +682,34 @@ impl Instruction for Swap {
         if current_slot != batch_slot {
             return Err(PammError::StaleQuoteSlots.into());
         }
-        // A batch clock `sequence` of 0 on the current slot marks the slot's
-        // first tick: the reading was taken at the very start of the slot, so
-        // the oracle update age is exactly 0 ms. (The slot equality required
-        // above already guarantees the batch slot matches the syscall clock
-        // slot.) Skip the millisecond diff and treat the quote as fresh.
-        let elapsed_ms = if batch_sequence == 0 {
+        // A batch clock `sequence` of 0 marks the slot's first tick: the reading
+        // was taken at the very start of the slot. That alone does NOT make the
+        // quote fresh — it only means the *clock* is at the slot boundary. The
+        // 0 ms shortcut is sound only when the oracle mid was itself updated in
+        // this same slot. So we require all three slots to agree:
+        //
+        //   pool.last_updated_slot == batch.slot == syscall Clock::slot
+        //
+        // The `current_slot != batch_slot` guard above already pins
+        // batch_slot == current_slot; here we additionally require the oracle's
+        // last-updated slot to match. Only then is a sequence of 0 proof of a
+        // fresh (0 ms old) update. Otherwise the mid was written in a prior slot
+        // and we fall through to the real millisecond diff.
+        let elapsed_ms = if batch_sequence == 0
+            && last_updated_slot == batch_slot
+            && last_updated_slot == current_slot
+        {
             0
         } else {
             batch_timestamp.saturating_sub(last_updated_timestamp) / 1_000_000
         };
         if elapsed_ms > MAX_QUOTE_AGE_MS {
             log!(
-                "StaleQuoteMillis: batch_timestamp {} ns, last_updated_timestamp {} ns, elapsed {} ms > {} ms",
+                "StaleQuoteMillis: batch_sequence {}, batch_slot {}, syscall_slot {}, pool_last_updated_slot {}, batch_timestamp {} ns, last_updated_timestamp {} ns, elapsed {} ms > {} ms",
+                batch_sequence,
+                batch_slot,
+                current_slot,
+                last_updated_slot,
                 batch_timestamp,
                 last_updated_timestamp,
                 elapsed_ms,
