@@ -441,13 +441,7 @@ fn cmd_update_oracle(g: &GlobalOpts, program_id: &Pubkey, args: &UpdateOracleArg
         bail!("mid must be non-zero");
     }
 
-    let ix = sdk::update_oracle(
-        program_id,
-        &authority.pubkey(),
-        &pool,
-        &slot_source,
-        mid,
-    );
+    let ix = sdk::update_oracle(program_id, &authority.pubkey(), &pool, &slot_source, mid);
     submit(g, ix, &authority)
 }
 
@@ -518,28 +512,26 @@ fn cmd_swap(g: &GlobalOpts, program_id: &Pubkey, args: &SwapArgs) -> Result<()> 
         .parse()
         .with_context(|| format!("parsing --tpu-address '{}'", args.tpu_address))?;
 
-    // Swap runs without RPC preflight simulation: the batch-clock / oracle
-    // state can shift between preflight and landing, so preflight rejections
-    // are noise rather than signal here. It also sends the signed transaction
-    // straight to the leader's TPU port over QUIC rather than relaying through
-    // the RPC node, to shave latency off landing.
+    // Swap always runs without RPC preflight simulation: the batch-clock /
+    // oracle state can shift between preflight and landing, so preflight
+    // rejections are noise rather than signal here.
     if args.repeat {
         if g.simulate {
             bail!("--repeat cannot be combined with --simulate");
         }
-        return send_swaps_until_cancelled(
-            g,
-            ix,
-            &signer,
-            Some(tpu_address),
-            args.repeat_delay_ms,
-        );
+        return send_swaps_until_cancelled(g, ix, &signer, Some(tpu_address), args.repeat_delay_ms);
     }
     // Append a nonce byte so the instruction data (and therefore the signed
     // transaction) is unique, even if an identical swap is fired again against
     // the same recent blockhash. The on-chain Swap handler reads only the first
     // 26 bytes and ignores the trailing nonce.
     ix.data.push(nonce_byte());
+    // Always fire the signed transaction straight at the leader's TPU port over
+    // QUIC, bypassing the RPC node, so a swap that would fail preflight still
+    // reaches the leader — the batch-clock / oracle state shifts between
+    // preflight and landing, so most simulation failures here are false
+    // positives. --no-confirm fires fire-and-forget for throughput; the default
+    // path sends the same way but additionally waits for confirmation.
     submit_with_opts(g, ix, &signer, true, args.no_confirm, Some(tpu_address))
 }
 
@@ -581,12 +573,8 @@ fn send_swaps_until_cancelled(
         // reads only the first 26 bytes and ignores the trailing nonce.
         let mut ix = ix.clone();
         ix.data.push(nonce_byte());
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&signer.pubkey()),
-            &[signer],
-            blockhash,
-        );
+        let tx =
+            Transaction::new_signed_with_payer(&[ix], Some(&signer.pubkey()), &[signer], blockhash);
 
         let result = if let Some((cache, addr)) = &tpu {
             match bincode::serialize(&tx) {
@@ -713,6 +701,9 @@ fn submit_with_client(
         }
         return Ok(());
     }
+
+    // Print tx signature
+    println!("submitting {}", &tx.signatures[0]);
 
     // When a TPU address is set, open a QUIC connection cache once and reuse it
     // across retries. It manages the TPU QUIC handshake (ALPN, client

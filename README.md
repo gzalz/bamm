@@ -11,12 +11,13 @@ By leveraging the batch clock account data on-chain programs can unlock time wit
 
 ## Time within a Slot
 
-bAMM will write intra-slot timestamps to the AMM pool state if the batch clock writer is a trusted block builder.
+bAMM will write intra-slot timestamps to the AMM pool state if the batch clock writer is a trusted block builder and is actively writing to the batch clock for the current slot.
 
 For demonstration purposes swaps are only allowed against this program's liquidity pool if:
 
 * A trusted block builder has write access to the batch clock account
 * The latest update is no more than 100ms old based on batch clock data
+* Minimum tokens out specified in the instruction can be satisfied by the pool's current state
 
 ## Optimal Performance with Maker Prioritization
 
@@ -33,4 +34,4 @@ Sub-slot timing logic work best with sub-slot scheduling features. [Jito's BAM M
 [BAM Block Builder Signer](https://explorer.solana.com/address/BAMgx3XPWrXkNUuQiVWUZU6eB2HQZdwz9HNnT4tpo8LG?cluster=testnet)\
 [Batch Clock Update Block](https://explorer.solana.com/block/422143302?cluster=testnet)\
 [Successful Swap (47ms quote age)](https://explorer.solana.com/tx/3KAZujeaZFHZpbTjZFjU15SVYTuXtMjujHpgLUyYZyojPHbBSDNoQ7XiSgZkaST5kextazMeZURkNpJJBqLJPT11?cluster=testnet)\
-[Failed Swap (250ms quote age)](https://explorer.solana.com/tx/26bAy6Ax8kg65jDDTYsf22hXkCAeFP765KG7W2tuoqdn8QeVC5Pezq6AwatXJR7kXrjRBfoP933PUWQvkUnNeurX?cluster=testnet)
+[Failed Swap (202ms quote age)](https://explorer.solana.com/tx/26bAy6Ax8kg65jDDTYsf22hXkCAeFP765KG7W2tuoqdn8QeVC5Pezq6AwatXJR7kXrjRBfoP933PUWQvkUnNeurX?cluster=testnet)
