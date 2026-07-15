@@ -1,7 +1,7 @@
 # bAMM
 ## (B)atch-level Automated Market Maker
 
-This repo serves as an educational implementation for awareness of an open and permissionless builder batch clock program on Solana to enable intra-slot timing to the SVM runtime.
+This repo serves as an educational implementation for awareness of an open and permissionless builder batch clock program on Solana to enable out-of-protocol intra-slot timing to the SVM runtime.
 
 bAMM is a proof-of-concept implementation of an automated market maker that exclusively uses sub-slot block builder wallclock time to determine the staleness of oracle updates. The batch clock account read by this program is owned by a permissionless batch clock program. Block builders need to write to this program continuously over the block packing process to provide value to consumers of the data.
 
@@ -20,9 +20,15 @@ For demonstration purposes swaps are only allowed against this program's liquidi
 
 ## Optimal Performance with Maker Prioritization
 
-Sub-slot timing logic work best with sub-slot scheduling features. Jito's BAM Maker Prioritization Plugin make it easy for liquidity providers to update their quotes at sub-slot frequencies.
+Sub-slot timing logic work best with sub-slot scheduling features. [Jito's BAM Maker Prioritization Plugin](https://bam.dev/plugins/) make it easy for liquidity providers to update their quotes at sub-slot frequencies.
 
 ## Impact
 * Use time within a slot as inputs to pricing curves
 * Use millisecond length TTL for quotes / orders when available
 * Enhanced shred / pre-conf data, notion of builder batches propagated in real-time
+
+## On-chain Data
+[BAM Block Builder Signer](https://explorer.solana.com/address/BAMgx3XPWrXkNUuQiVWUZU6eB2HQZdwz9HNnT4tpo8LG?cluster=testnet)
+[Batch Clock Update Block](https://explorer.solana.com/block/422143302?cluster=testnet)
+[Successful Swap (47ms quote age)](https://explorer.solana.com/tx/3KAZujeaZFHZpbTjZFjU15SVYTuXtMjujHpgLUyYZyojPHbBSDNoQ7XiSgZkaST5kextazMeZURkNpJJBqLJPT11?cluster=testnet)
+[Failed Swap (250ms quote age)](https://explorer.solana.com/tx/26bAy6Ax8kg65jDDTYsf22hXkCAeFP765KG7W2tuoqdn8QeVC5Pezq6AwatXJR7kXrjRBfoP933PUWQvkUnNeurX?cluster=testnet)
