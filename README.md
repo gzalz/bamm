@@ -22,7 +22,8 @@ For demonstration purposes swaps are only allowed against this program's liquidi
 
 Sub-slot timing logic work best with sub-slot scheduling features. [Jito's BAM Maker Prioritization Plugin](https://bam.dev/plugins/) make it easy for liquidity providers to update their quotes at sub-slot frequencies.
 
-[(MPP + Batch Clock) per Batch Scheduling](https://explorer.solana.com/block/422144963?cluster=testnet)\
+[(MPP + Batch Clock) per Batch Scheduling](https://explorer.solana.com/block/422144963?cluster=testnet)
+
 ## Impact
 * Use time within a slot as inputs to pricing curves
 * Use millisecond length TTL for quotes / orders when available
